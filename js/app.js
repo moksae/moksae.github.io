@@ -11,7 +11,6 @@ const App = (() => {
     isAdmin: false,
     token: null, owner: null, repo: null,
     // Feed
-    feedCat: null,
     feedView: 'list',     // 'list' | 'thread'
     feedThreadId: null,
     replyTo: null,
@@ -76,50 +75,58 @@ const App = (() => {
     }
   }
 
+  // Safely encode JSON with full UTF-8 support (no btoa+unescape hack)
+  function jsonToBase64(obj) {
+    const json = JSON.stringify(obj, null, 2);
+    const bytes = new TextEncoder().encode(json);
+    let bin = '';
+    bytes.forEach(b => { bin += String.fromCharCode(b); });
+    return btoa(bin);
+  }
+
+  function makeHeaders() {
+    // Use Headers object so the browser validates each value individually
+    const h = new Headers();
+    h.set('Authorization', 'token ' + sanitizeASCII(S.token));
+    h.set('Accept', 'application/vnd.github.v3+json');
+    h.set('Content-Type', 'application/json');
+    return h;
+  }
+
   async function saveData(msg = 'Update') {
     if (!S.token || !S.owner || !S.repo) throw new Error('GitHub credentials required');
-    const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(S.data, null, 2))));
-    const apiUrl = 'https://api.github.com/repos/' + S.owner + '/' + S.repo + '/contents/data/posts.json';
-    const hdrs = { Authorization: 'token ' + S.token, Accept: 'application/vnd.github.v3+json', 'Content-Type': 'application/json' };
 
-    // Get fresh SHA (or use cached)
-    if (!S._fileSha) {
-      const infoR = await fetch(apiUrl, { headers: hdrs });
-      if (!infoR.ok) throw new Error('Could not fetch file info (' + infoR.status + ')');
-      const info = await infoR.json();
-      S._fileSha = info.sha;
-    }
+    const apiUrl = 'https://api.github.com/repos/'
+      + encodeURIComponent(S.owner) + '/'
+      + encodeURIComponent(S.repo)
+      + '/contents/data/posts.json';
 
-    const r = await fetch(apiUrl, {
-      method: 'PUT',
-      headers: hdrs,
-      body: JSON.stringify({ message: msg, content: encoded, sha: S._fileSha })
+    // Always fetch fresh SHA before writing
+    const infoR = await fetch(apiUrl, { headers: makeHeaders() });
+    if (!infoR.ok) throw new Error('Could not read file from GitHub (' + infoR.status + ')');
+    const info = await infoR.json();
+    const sha = info.sha;
+    if (!sha) throw new Error('GitHub did not return a SHA — check repo name');
+
+    const body = JSON.stringify({
+      message: msg,          // always ASCII
+      content: jsonToBase64(S.data),
+      sha: sha
     });
 
-    if (r.status === 409) {
-      // SHA conflict — force refresh and retry once
-      S._fileSha = null;
-      return saveData(msg);
-    }
-    if (!r.ok) {
-      const e = await r.json().catch(() => ({}));
-      throw new Error(e.message || 'GitHub API error ' + r.status);
-    }
+    const putR = await fetch(apiUrl, { method: 'PUT', headers: makeHeaders(), body });
 
-    // Cache the new SHA from response to avoid an extra GET next save
-    try {
-      const result = await r.json();
-      if (result && result.content && result.content.sha) {
-        S._fileSha = result.content.sha;
-      }
-    } catch (_) { S._fileSha = null; }
+    if (!putR.ok) {
+      const e = await putR.json().catch(() => ({}));
+      throw new Error(e.message || 'GitHub save failed (' + putR.status + ')');
+    }
+    await putR.json().catch(() => {});
   }
 
   // ─── Render All ─────────────────────────────────
   function renderAll() {
     renderProfile();
     renderSidebarCounts();
-    renderFeedCatDropdown();
     renderSection(S.section);
   }
 
@@ -127,7 +134,8 @@ const App = (() => {
     const c = S.data.config || {};
     document.getElementById('profile-name').textContent = c.author || 'Author';
     document.getElementById('profile-bio').textContent  = c.bio || '';
-    document.getElementById('stat-posts').textContent = S.data.posts.length;
+    const totalPosts = S.data.posts.filter(p => !p.parentId).length + S.data.reviews.length + S.data.writings.length;
+    document.getElementById('stat-posts').textContent = totalPosts;
     document.getElementById('stat-reviews').textContent = S.data.reviews.length;
     document.getElementById('stat-writings').textContent = S.data.writings.length;
   }
@@ -148,13 +156,7 @@ const App = (() => {
     if (allEl) allEl.textContent = S.data.reviews.length;
   }
 
-  function renderFeedCatDropdown() {
-    const sel = document.getElementById('compose-tag');
-    sel.innerHTML = '<option value="">No category</option>';
-    (S.data.config.feedCategories || []).forEach(c => {
-      sel.innerHTML += `<option value="${c}">${c}</option>`;
-    });
-  }
+  // Feed category dropdown removed
 
   // ─── Section Navigation ─────────────────────────
   function renderSection(sec) {
@@ -178,33 +180,28 @@ const App = (() => {
     const el = document.getElementById('posts-list');
     document.getElementById('compose-wrap').className = `compose ${S.isAdmin ? 'show' : ''}`;
 
-    // Build unified item list
+    // Build unified item list from all content types
     const items = [];
-
-    // Top-level posts (include thread replies count)
     S.data.posts.filter(p => !p.parentId).forEach(p => {
       items.push({ type: 'post', ts: p.timestamp, data: p });
     });
-
-    // Reviews
     S.data.reviews.forEach(r => {
       items.push({ type: 'review', ts: r.timestamp, data: r });
     });
-
-    // Writings
     S.data.writings.forEach(w => {
       items.push({ type: 'writing', ts: w.timestamp, data: w });
     });
 
-    // Sort newest first
+    // Sort newest first, show only latest 3
     items.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    const shown = items.slice(0, 3);
 
-    if (!items.length) {
+    if (!shown.length) {
       el.innerHTML = '<div class="empty"><div class="empty-icon">🌿</div><div class="empty-msg">No posts yet</div></div>';
       return;
     }
 
-    el.innerHTML = items.map(item => {
+    el.innerHTML = shown.map(item => {
       if (item.type === 'post')    return postCardHTML(item.data);
       if (item.type === 'review')  return reviewCardHTML(item.data);
       if (item.type === 'writing') return writingCardHTML(item.data);
@@ -275,7 +272,7 @@ const App = (() => {
             </div>
             <div class="post-text">${fmtContent(p.content)}</div>
             ${imgs ? `<div class="post-images">${imgs}</div>` : ''}
-            ${(p.categories||[]).length ? `<div class="post-tags">${p.categories.map(t=>`<span class="p-tag" onclick="event.stopPropagation();App.feedCat('${t}')">#${t}</span>`).join('')}</div>` : ''}
+            ${(p.categories||[]).length ? `<div class="post-tags">${p.categories.map(t=>`<span class="p-tag" onclick="event.stopPropagation()">#${t}</span>`).join('')}</div>` : ''}
             <div class="post-actions">
               ${rc ? `<button class="act-btn" onclick="event.stopPropagation();App.openFeedThread('${p.threadId}')">💬 ${rc}</button>` : ''}
               ${adminA}
@@ -399,7 +396,7 @@ const App = (() => {
     document.getElementById('reply-banner').style.display = 'none';
     document.getElementById('compose-wrap').classList.add('show');
     document.getElementById('compose-ta').value = p.content;
-    document.getElementById('compose-tag').value = (p.categories||[])[0] || '';
+    // category select removed
     document.getElementById('compose-ta').focus();
     updateCC();
   }
@@ -407,7 +404,7 @@ const App = (() => {
   async function sendPost() {
     const text = document.getElementById('compose-ta').value.trim();
     if (!text && S._pendingImages.length === 0) return;
-    const cat = document.getElementById('compose-tag').value;
+    const cat = '';  // feed categories removed
     const btn = document.getElementById('send-btn');
     btn.disabled = true; btn.textContent = 'Saving...';
     try {
@@ -452,16 +449,22 @@ const App = (() => {
   async function uploadImageToGitHub(file) {
     if (!S.token || !S.owner || !S.repo) throw new Error('Admin login required to upload images');
     const ext = file.name.split('.').pop().toLowerCase() || 'jpg';
-    const fname = `img-${Date.now()}-${Math.random().toString(36).slice(2,7)}.${ext}`;
+    const fname = 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2,7) + '.' + ext;
     const b64 = await fileToBase64(file);
-    const apiUrl = `https://api.github.com/repos/${S.owner}/${S.repo}/contents/images/${fname}`;
+    const apiUrl = 'https://api.github.com/repos/'
+      + encodeURIComponent(S.owner) + '/'
+      + encodeURIComponent(S.repo)
+      + '/contents/images/' + fname;
     const r = await fetch(apiUrl, {
       method: 'PUT',
-      headers: { Authorization: `token ${S.token}`, Accept: 'application/vnd.github.v3+json', 'Content-Type': 'application/json' },
+      headers: makeHeaders(),
       body: JSON.stringify({ message: 'Upload image', content: b64 })
     });
-    if (!r.ok) { const e = await r.json().catch(()=>({})); throw new Error(e.message || 'Image upload failed'); }
-    return `https://raw.githubusercontent.com/${S.owner}/${S.repo}/main/images/${fname}`;
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error(e.message || 'Image upload failed (' + r.status + ')');
+    }
+    return 'https://raw.githubusercontent.com/' + S.owner + '/' + S.repo + '/main/images/' + fname;
   }
 
   function fileToBase64(file) {
@@ -496,11 +499,7 @@ const App = (() => {
     } catch(e) { toast(e.message, 'err'); loadData(); }
   }
 
-  function feedCat(cat) {
-    S.feedCat = cat || null;
-    if (S.feedView === 'thread') closeFeedThread();
-    renderFeed();
-  }
+
 
   function updateCC() {
     const len = document.getElementById('compose-ta').value.length;
@@ -844,10 +843,15 @@ const App = (() => {
   }
 
   // ─── Admin ──────────────────────────────────────
+  // Strip anything non-ASCII — prevents "non ISO-8859-1 code point" fetch error
+  function sanitizeASCII(s) {
+    return (s || '').replace(/[^\x20-\x7E]/g, '').trim();
+  }
+
   function loadCreds() {
-    const t = localStorage.getItem('gh_token');
-    const o = localStorage.getItem('gh_owner');
-    const r = localStorage.getItem('gh_repo');
+    const t = sanitizeASCII(localStorage.getItem('gh_token'));
+    const o = sanitizeASCII(localStorage.getItem('gh_owner'));
+    const r = sanitizeASCII(localStorage.getItem('gh_repo'));
     if (t && o && r) { S.isAdmin = true; S.token = t; S.owner = o; S.repo = r; updateAdminUI(); }
   }
 
@@ -864,9 +868,9 @@ const App = (() => {
   }
 
   function saveAdmin() {
-    const t = document.getElementById('m-token').value.trim();
-    const o = document.getElementById('m-owner').value.trim();
-    const r = document.getElementById('m-repo').value.trim();
+    const t = sanitizeASCII(document.getElementById('m-token').value);
+    const o = sanitizeASCII(document.getElementById('m-owner').value);
+    const r = sanitizeASCII(document.getElementById('m-repo').value);
     if (!t || !o || !r) { toast('All fields required', 'err'); return; }
     localStorage.setItem('gh_token', t);
     localStorage.setItem('gh_owner', o);
@@ -1044,7 +1048,7 @@ const App = (() => {
   return {
     init,
     // Feed
-    openFeedThread, closeFeedThread, replyPost, editPost, deletePost, feedCat,
+    openFeedThread, closeFeedThread, replyPost, editPost, deletePost,
     goToReview, goToWriting, _removeImg,
     // Reviews
     openReview, closeReview, editReview, deleteReview,
