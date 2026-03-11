@@ -26,7 +26,9 @@ const App = (() => {
     editWriting: null,
     // Current section
     section: 'home',
-    _pendingImages: [],  // files queued for upload
+    _pendingImages: [],        // feed post images
+    _pendingReviewImages: [],     // review images
+    _pendingWritingImages: [],    // writing images
     _fileSha: null,      // cached GitHub SHA
   };
 
@@ -75,52 +77,71 @@ const App = (() => {
     }
   }
 
-  // Safely encode JSON with full UTF-8 support (no btoa+unescape hack)
-  function jsonToBase64(obj) {
-    const json = JSON.stringify(obj, null, 2);
-    const bytes = new TextEncoder().encode(json);
-    let bin = '';
-    bytes.forEach(b => { bin += String.fromCharCode(b); });
-    return btoa(bin);
+  // ── GitHub API via XHR ──────────────────────────────
+  // XHR does NOT enforce ISO-8859-1 on header values.
+  // This permanently fixes the "non ISO-8859-1 code point" fetch error.
+
+  function utf8ToBase64(str) {
+    // Proper UTF-8 → base64 (supports all Korean, emoji, etc.)
+    const bytes = new TextEncoder().encode(str);
+    let binary = '';
+    bytes.forEach(b => { binary += String.fromCharCode(b); });
+    return btoa(binary);
   }
 
-  function makeHeaders() {
-    // Use Headers object so the browser validates each value individually
-    const h = new Headers();
-    h.set('Authorization', 'token ' + sanitizeASCII(S.token));
-    h.set('Accept', 'application/vnd.github.v3+json');
-    h.set('Content-Type', 'application/json');
-    return h;
-  }
-
-  async function saveData(msg = 'Update') {
-    if (!S.token || !S.owner || !S.repo) throw new Error('GitHub credentials required');
-
-    const apiUrl = 'https://api.github.com/repos/'
-      + encodeURIComponent(S.owner) + '/'
-      + encodeURIComponent(S.repo)
-      + '/contents/data/posts.json';
-
-    // Always fetch fresh SHA before writing
-    const infoR = await fetch(apiUrl, { headers: makeHeaders() });
-    if (!infoR.ok) throw new Error('Could not read file from GitHub (' + infoR.status + ')');
-    const info = await infoR.json();
-    const sha = info.sha;
-    if (!sha) throw new Error('GitHub did not return a SHA — check repo name');
-
-    const body = JSON.stringify({
-      message: msg,          // always ASCII
-      content: jsonToBase64(S.data),
-      sha: sha
+  function ghXHR(method, path, bodyObj) {
+    // Returns a Promise. Uses XMLHttpRequest instead of fetch to avoid
+    // the browser's strict ISO-8859-1 header validation in fetch().
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const url = 'https://api.github.com/repos/' + S.owner + '/' + S.repo + path;
+      xhr.open(method, url, true);
+      xhr.setRequestHeader('Authorization', 'token ' + S.token);
+      xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
+      if (bodyObj !== undefined) xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.onload = () => {
+        try { resolve({ status: xhr.status, body: JSON.parse(xhr.responseText) }); }
+        catch (_) { resolve({ status: xhr.status, body: {} }); }
+      };
+      xhr.onerror = () => reject(new Error('Network error — check your internet connection'));
+      xhr.send(bodyObj !== undefined ? JSON.stringify(bodyObj) : null);
     });
+  }
 
-    const putR = await fetch(apiUrl, { method: 'PUT', headers: makeHeaders(), body });
+  async function saveData(msg) {
+    if (!S.token || !S.owner || !S.repo) throw new Error('Not logged in as admin');
+    const label = msg || 'Update';
 
-    if (!putR.ok) {
-      const e = await putR.json().catch(() => ({}));
-      throw new Error(e.message || 'GitHub save failed (' + putR.status + ')');
+    // Step 1: get current SHA (always fresh)
+    const getRes = await ghXHR('GET', '/contents/data/posts.json');
+    if (getRes.status !== 200) throw new Error('Could not read posts.json (HTTP ' + getRes.status + ')');
+    const sha = getRes.body.sha;
+    if (!sha) throw new Error('No SHA returned — check repo/file exists');
+
+    // Step 2: write new content
+    const content = utf8ToBase64(JSON.stringify(S.data, null, 2));
+    const putRes = await ghXHR('PUT', '/contents/data/posts.json', { message: label, content, sha });
+    if (putRes.status !== 200 && putRes.status !== 201) {
+      throw new Error((putRes.body && putRes.body.message) || 'Save failed (HTTP ' + putRes.status + ')');
     }
-    await putR.json().catch(() => {});
+  }
+
+  async function uploadImageXHR(file) {
+    if (!S.token || !S.owner || !S.repo) throw new Error('Admin login required');
+    const ext = (file.name.split('.').pop() || 'jpg').toLowerCase();
+    const fname = 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2,6) + '.' + ext;
+    // Read file as base64
+    const b64 = await new Promise((res, rej) => {
+      const reader = new FileReader();
+      reader.onload = () => res(reader.result.split(',')[1]);
+      reader.onerror = rej;
+      reader.readAsDataURL(file);
+    });
+    const r = await ghXHR('PUT', '/contents/images/' + fname, { message: 'Upload image', content: b64 });
+    if (r.status !== 200 && r.status !== 201) {
+      throw new Error((r.body && r.body.message) || 'Image upload failed (HTTP ' + r.status + ')');
+    }
+    return 'https://raw.githubusercontent.com/' + S.owner + '/' + S.repo + '/main/images/' + fname;
   }
 
   // ─── Render All ─────────────────────────────────
@@ -134,17 +155,18 @@ const App = (() => {
     const c = S.data.config || {};
     document.getElementById('profile-name').textContent = c.author || 'Author';
     document.getElementById('profile-bio').textContent  = c.bio || '';
-    const totalPosts = S.data.posts.filter(p => !p.parentId).length + S.data.reviews.length + S.data.writings.length;
-    document.getElementById('stat-posts').textContent = totalPosts;
-    document.getElementById('stat-reviews').textContent = S.data.reviews.length;
+    const topPosts   = S.data.posts.filter(p => !p.parentId).length;
+    const totalAll   = topPosts + S.data.reviews.length + S.data.writings.length;
+    document.getElementById('stat-posts').textContent    = totalAll;
+    document.getElementById('stat-reviews').textContent  = S.data.reviews.length;
     document.getElementById('stat-writings').textContent = S.data.writings.length;
   }
 
   function renderSidebarCounts() {
-    const totalAll = S.data.posts.filter(p=>!p.parentId).length + S.data.reviews.length + S.data.writings.length;
-    document.getElementById('badge-home').textContent    = totalAll;
-    document.getElementById('badge-reviews').textContent = S.data.reviews.length;
-    document.getElementById('badge-writings').textContent= S.data.writings.length;
+    const _topPosts = S.data.posts.filter(p=>!p.parentId).length;
+    document.getElementById('badge-home').textContent     = _topPosts + S.data.reviews.length + S.data.writings.length;
+    document.getElementById('badge-reviews').textContent  = S.data.reviews.length;
+    document.getElementById('badge-writings').textContent = S.data.writings.length;
 
     // Review sub-nav counts
     const rv = S.data.reviews;
@@ -412,7 +434,7 @@ const App = (() => {
       const imageUrls = [];
       for (const file of S._pendingImages) {
         btn.textContent = `Uploading image…`;
-        const url = await uploadImageToGitHub(file);
+        const url = await uploadImageXHR(file);
         imageUrls.push(url);
       }
 
@@ -446,35 +468,9 @@ const App = (() => {
   }
 
   // Upload image file to GitHub repo → returns raw URL
-  async function uploadImageToGitHub(file) {
-    if (!S.token || !S.owner || !S.repo) throw new Error('Admin login required to upload images');
-    const ext = file.name.split('.').pop().toLowerCase() || 'jpg';
-    const fname = 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2,7) + '.' + ext;
-    const b64 = await fileToBase64(file);
-    const apiUrl = 'https://api.github.com/repos/'
-      + encodeURIComponent(S.owner) + '/'
-      + encodeURIComponent(S.repo)
-      + '/contents/images/' + fname;
-    const r = await fetch(apiUrl, {
-      method: 'PUT',
-      headers: makeHeaders(),
-      body: JSON.stringify({ message: 'Upload image', content: b64 })
-    });
-    if (!r.ok) {
-      const e = await r.json().catch(() => ({}));
-      throw new Error(e.message || 'Image upload failed (' + r.status + ')');
-    }
     return 'https://raw.githubusercontent.com/' + S.owner + '/' + S.repo + '/main/images/' + fname;
   }
 
-  function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result.split(',')[1]);
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  }
 
   function clearImagePreviews() {
     const wrap = document.getElementById('image-preview-wrap');
@@ -592,6 +588,7 @@ const App = (() => {
             </div>
             <div>
               <div class="rd-content">${fmtContent(t.content)}</div>
+              ${(t.images||[]).length ? `<div class="post-images">${t.images.map(u=>'<img src="'+u+'" class="post-img" loading="lazy">').join('')}</div>` : ''}
               <div class="rd-time">${relTime(t.timestamp)}</div>
             </div>
           </div>`).join('')}
@@ -634,10 +631,19 @@ const App = (() => {
     S.editReview = null;
   }
 
-  function buildThreadEntry(content = '') {
+  function buildThreadEntry(content = '', imgs = []) {
+    const imgPreviews = imgs.map((u,i) =>
+      `<div class="img-preview-item" data-url="${u}"><img src="${u}"><button onclick="this.closest('.img-preview-item').remove()" type="button">✕</button></div>`
+    ).join('');
     return `<div class="rc-thread-entry">
-      <textarea class="rc-thread-ta" placeholder="이 타래의 내용을 입력하세요...">${esc(content)}</textarea>
-      <button class="rc-del-thread" onclick="this.closest('.rc-thread-entry').remove()">✕</button>
+      <textarea class="rc-thread-ta" placeholder="Content...">${esc(content)}</textarea>
+      <div class="rc-thread-imgs">
+        <div class="image-preview-wrap rc-img-wrap">${imgPreviews}</div>
+        <label class="img-upload-btn" title="Attach image" style="margin-top:4px">
+          📎 <input type="file" class="rc-img-input" accept="image/jpeg,image/png,image/gif,image/webp" multiple style="display:none">
+        </label>
+      </div>
+      <button class="rc-del-thread" onclick="this.closest('.rc-thread-entry').remove()" type="button">✕</button>
     </div>`;
   }
 
@@ -648,35 +654,55 @@ const App = (() => {
   async function sendReview() {
     const title = document.getElementById('rc-title').value.trim();
     const cat   = document.getElementById('rc-cat').value;
-    const tas   = [...document.querySelectorAll('#rc-threads-wrap .rc-thread-ta')];
-    const threads = tas.map(t => t.value.trim()).filter(Boolean);
-    if (!title || !threads.length) { toast('Title and content required', 'err'); return; }
+    const entries = [...document.querySelectorAll('#rc-threads-wrap .rc-thread-entry')];
+    if (!title || !entries.length) { toast('Title and content required', 'err'); return; }
 
     const btn = document.getElementById('rc-send');
     btn.disabled = true; btn.textContent = 'Saving...';
     try {
+      const now = new Date().toISOString();
+      const threadData = [];
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const text = entry.querySelector('.rc-thread-ta').value.trim();
+        if (!text) continue;
+        // Upload any new image files for this thread
+        const imgs = [];
+        // Existing images (from data-url)
+        entry.querySelectorAll('.img-preview-item[data-url]').forEach(el => imgs.push(el.dataset.url));
+        // New files (attached as ._file on preview divs)
+        const newImgDivs = entry.querySelectorAll('.img-preview-item:not([data-url])');
+        for (const div of newImgDivs) {
+          if (div._file) {
+            btn.textContent = 'Uploading image…';
+            imgs.push(await uploadImageXHR(div._file));
+          }
+        }
+        const prev = S.editReview && S.editReview.threads && S.editReview.threads[i];
+        threadData.push({
+          id: prev ? prev.id : `rv${Date.now()}-t${i}`,
+          content: text,
+          images: imgs,
+          timestamp: prev ? prev.timestamp : now
+        });
+      }
+      if (!threadData.length) { toast('Please add content', 'err'); btn.disabled = false; btn.textContent = 'Save'; return; }
+
+      btn.textContent = 'Saving...';
       if (S.editReview) {
         S.editReview.title = title;
         S.editReview.category = cat;
-        S.editReview.threads = threads.map((c,i) => ({
-          id: S.editReview.threads[i]?.id || `rv${Date.now()}-t${i}`,
-          content: c,
-          timestamp: S.editReview.threads[i]?.timestamp || new Date().toISOString()
-        }));
-        S.editReview.edited = true; S.editReview.editedAt = new Date().toISOString();
+        S.editReview.threads = threadData;
+        S.editReview.edited = true; S.editReview.editedAt = now;
         S.editReview = null;
       } else {
-        const id = `review-${Date.now()}`;
-        const now = new Date().toISOString();
-        S.data.reviews.unshift({
-          id, title, category: cat, timestamp: now, edited: false, editedAt: null,
-          threads: threads.map((c,i) => ({ id: `${id}-t${i}`, content: c, timestamp: now }))
-        });
+        const id = 'review-' + Date.now();
+        S.data.reviews.unshift({ id, title, category: cat, timestamp: now, edited: false, editedAt: null, threads: threadData });
       }
       await saveData('Save review');
       closeReviewCompose();
       renderProfile(); renderSidebarCounts(); renderReviews();
-      toast('리뷰가 Saved ✓', 'ok');
+      toast('Review saved ✓', 'ok');
     } catch(e) { toast(e.message, 'err'); }
     btn.disabled = false; btn.textContent = 'Save';
   }
@@ -750,7 +776,7 @@ const App = (() => {
       </div>` : '';
 
     dv.innerHTML = `
-      <button class="td-back" onclick="App.closeWriting()">← 글 목록</button>
+      <button class="td-back" onclick="App.closeWriting()">← Back to writings</button>
       <div class="wd-header">
         <div class="wd-tags">${(w.tags||[]).map(t=>`<span class="w-tag">${esc(t)}</span>`).join('')}</div>
         <div class="wd-title">${esc(w.title)}</div>
@@ -758,6 +784,7 @@ const App = (() => {
         ${adminA}
       </div>
       <div class="wd-body">${fmtWriting(w.content)}</div>
+      ${(w.images||[]).length ? `<div class="post-images" style="padding:0 28px 20px">${w.images.map(u=>'<img src="'+u+'" class="post-img" loading="lazy">').join('')}</div>` : ''}
       <div class="comments-wrap" style="padding:0 24px 32px">
         <div class="comments-title">Comments</div>
         <div id="writing-comments"></div>
@@ -787,6 +814,8 @@ const App = (() => {
       document.getElementById('wc-title').value = '';
       document.getElementById('wc-tags').value = '';
       document.getElementById('wc-content').value = '';
+      document.getElementById('wc-img-wrap').innerHTML = '';
+      S._pendingWritingImages = [];
     }
     wc.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
@@ -794,29 +823,48 @@ const App = (() => {
   function closeWritingCompose() {
     document.getElementById('writing-compose').classList.remove('show');
     S.editWriting = null;
+    S._pendingWritingImages = [];
+    const wrap = document.getElementById('wc-img-wrap');
+    if (wrap) wrap.innerHTML = '';
   }
 
   async function sendWriting() {
-    const title = document.getElementById('wc-title').value.trim();
-    const tagsRaw = document.getElementById('wc-tags').value.trim();
-    const content = document.getElementById('wc-content').value.trim();
-    if (!title || !content) { toast('Title and content required', 'err'); return; }
-    const tags = tagsRaw ? tagsRaw.split(',').map(t=>t.trim()).filter(Boolean) : [];
-    const excerpt = content.substring(0, 80) + (content.length > 80 ? '...' : '');
+    const title    = document.getElementById('wc-title').value.trim();
+    const tagsRaw  = document.getElementById('wc-tags').value.trim();
+    const wContent = document.getElementById('wc-content').value.trim();
+    if (!title || !wContent) { toast('Title and content required', 'err'); return; }
+    const tags    = tagsRaw ? tagsRaw.split(',').map(t=>t.trim()).filter(Boolean) : [];
+    const excerpt = wContent.substring(0, 80) + (wContent.length > 80 ? '...' : '');
 
     const btn = document.getElementById('wc-send');
     btn.disabled = true; btn.textContent = 'Saving...';
     try {
+      // Upload images
+      const imageUrls = [];
       if (S.editWriting) {
-        Object.assign(S.editWriting, { title, content, tags, excerpt, edited: true, editedAt: new Date().toISOString() });
+        // Keep existing images
+        (S.editWriting.images || []).forEach(u => {
+          const keep = document.querySelector(`#wc-img-wrap [data-url="${u}"]`);
+          if (keep) imageUrls.push(u);
+        });
+      }
+      for (const f of S._pendingWritingImages) {
+        btn.textContent = 'Uploading image…';
+        imageUrls.push(await uploadImageXHR(f));
+      }
+      btn.textContent = 'Saving...';
+
+      if (S.editWriting) {
+        Object.assign(S.editWriting, { title, content: wContent, tags, excerpt, images: imageUrls, edited: true, editedAt: new Date().toISOString() });
         S.editWriting = null;
       } else {
-        S.data.writings.unshift({ id: `writing-${Date.now()}`, title, excerpt, content, tags, timestamp: new Date().toISOString(), edited: false, editedAt: null });
+        S.data.writings.unshift({ id: 'writing-' + Date.now(), title, excerpt, content: wContent, tags, images: imageUrls, timestamp: new Date().toISOString(), edited: false, editedAt: null });
       }
+      S._pendingWritingImages = [];
       await saveData('Save writing');
       closeWritingCompose();
       renderProfile(); renderSidebarCounts(); renderWritings();
-      toast('글이 Saved ✓', 'ok');
+      toast('Writing saved ✓', 'ok');
     } catch(e) { toast(e.message, 'err'); }
     btn.disabled = false; btn.textContent = 'Save';
   }
@@ -829,6 +877,11 @@ const App = (() => {
     document.getElementById('wc-title').value = w.title;
     document.getElementById('wc-tags').value = (w.tags||[]).join(', ');
     document.getElementById('wc-content').value = w.content;
+    S._pendingWritingImages = [];
+    const wcWrap = document.getElementById('wc-img-wrap');
+    if (wcWrap) wcWrap.innerHTML = (w.images||[]).map(u =>
+      `<div class="img-preview-item" data-url="${u}"><img src="${u}"><button onclick="this.closest('.img-preview-item').remove()" type="button">✕</button></div>`
+    ).join('');
   }
 
   async function deleteWriting(id) {
@@ -892,11 +945,11 @@ const App = (() => {
     const fab = document.getElementById('fab');
     if (S.isAdmin) {
       btn.classList.add('on');
-      btn.querySelector('.al').textContent = '관리자 로그아웃';
+      btn.querySelector('.al').textContent = 'Logout';
       fab.classList.add('show');
     } else {
       btn.classList.remove('on');
-      btn.querySelector('.al').textContent = '관리자 로그인';
+      btn.querySelector('.al').textContent = 'Admin Login';
       fab.classList.remove('show');
     }
   }
@@ -912,14 +965,14 @@ const App = (() => {
   // ─── Util ───────────────────────────────────────
   function relTime(iso) {
     const d = (Date.now() - new Date(iso)) / 1000;
-    if (d < 60) return '방금';
-    if (d < 3600) return `${Math.floor(d/60)}분 전`;
-    if (d < 86400) return `${Math.floor(d/3600)}시간 전`;
-    if (d < 604800) return `${Math.floor(d/86400)}일 전`;
-    return new Date(iso).toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' });
+    if (d < 60)     return 'just now';
+    if (d < 3600)   return Math.floor(d/60) + 'm ago';
+    if (d < 86400)  return Math.floor(d/3600) + 'h ago';
+    if (d < 604800) return Math.floor(d/86400) + 'd ago';
+    return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   }
   function fmtDate(iso) {
-    return new Date(iso).toLocaleString('ko-KR', { year:'numeric', month:'long', day:'numeric' });
+    return new Date(iso).toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
   }
   function esc(s) {
     return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -1023,6 +1076,52 @@ const App = (() => {
     // Writing compose
     document.getElementById('wc-send').onclick = sendWriting;
     document.getElementById('wc-cancel').onclick = closeWritingCompose;
+
+    const wcImgInput = document.getElementById('wc-img-input');
+    if (wcImgInput) {
+      wcImgInput.addEventListener('change', e => {
+        const files = Array.from(e.target.files || []);
+        const allowed = ['image/jpeg','image/png','image/gif','image/webp'];
+        const wrap = document.getElementById('wc-img-wrap');
+        files.forEach(f => {
+          if (!allowed.includes(f.type)) { toast('JPG/PNG/GIF/WEBP only', 'err'); return; }
+          if (f.size > 10*1024*1024) { toast('Max 10MB per image', 'err'); return; }
+          S._pendingWritingImages.push(f);
+          const reader = new FileReader();
+          reader.onload = ev => {
+            const div = document.createElement('div');
+            div.className = 'img-preview-item';
+            const idx = S._pendingWritingImages.length - 1;
+            div.innerHTML = `<img src="${ev.target.result}"><button type="button" onclick="S._pendingWritingImages.splice(${idx},1);this.closest('.img-preview-item').remove()">✕</button>`;
+            wrap.appendChild(div);
+          };
+          reader.readAsDataURL(f);
+        });
+        wcImgInput.value = '';
+      });
+    }
+
+    // rc-img inputs (review thread images) — delegated
+    document.getElementById('rc-threads-wrap').addEventListener('change', e => {
+      const input = e.target.closest('.rc-img-input');
+      if (!input) return;
+      const entry = input.closest('.rc-thread-entry');
+      const wrap  = entry.querySelector('.rc-img-wrap');
+      Array.from(input.files || []).forEach(f => {
+        if (f.size > 10*1024*1024) { toast('Max 10MB per image', 'err'); return; }
+        const reader = new FileReader();
+        reader.onload = ev => {
+          const div = document.createElement('div');
+          div.className = 'img-preview-item';
+          div.innerHTML = `<img src="${ev.target.result}"><button type="button" onclick="this.closest('.img-preview-item').remove()">✕</button>`;
+          div.querySelector('img').dataset.file = 'new';
+          div._file = f;
+          wrap.appendChild(div);
+        };
+        reader.readAsDataURL(f);
+      });
+      input.value = '';
+    });
   }
 
   // Navigate from Main feed card → correct section + detail
