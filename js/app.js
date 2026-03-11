@@ -63,7 +63,7 @@ const App = (() => {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open(method, 'https://api.github.com/repos/' + S.owner + '/' + S.repo + path, true);
-      xhr.setRequestHeader('Authorization', 'token ' + S.token);
+      xhr.setRequestHeader('Authorization', 'token ' + S.token.replace(/[^\x20-\x7E]/g, '').trim());
       xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
       if (body !== undefined) xhr.setRequestHeader('Content-Type', 'application/json');
       xhr.onload = () => { let j={}; try{j=JSON.parse(xhr.responseText);}catch(_){} resolve({status:xhr.status, body:j}); };
@@ -505,8 +505,11 @@ const App = (() => {
     const o=(ge('m-owner')?ge('m-owner').value:'').trim();
     const r=(ge('m-repo') ?ge('m-repo').value :'').trim();
     if(!t||!o||!r){toast('All fields required','err');return;}
-    localStorage.setItem('gh_token',t); localStorage.setItem('gh_owner',o); localStorage.setItem('gh_repo',r);
-    S.isAdmin=true;S.token=t;S.owner=o;S.repo=r;
+    function ascii(s){return (s||'').replace(/[^\x20-\x7E]/g,'').trim();}
+    const cleanT=ascii(t),cleanO=ascii(o),cleanR=ascii(r);
+    if(!cleanT||!cleanO||!cleanR){toast('All fields required (check for special characters)','err');return;}
+    localStorage.setItem('gh_token',cleanT); localStorage.setItem('gh_owner',cleanO); localStorage.setItem('gh_repo',cleanR);
+    S.isAdmin=true;S.token=cleanT;S.owner=cleanO;S.repo=cleanR;
     closeAdminModal(); updateAdminUI(); renderSection(S.section); toast('Admin mode enabled ✓','ok');
   }
   function logoutAdmin() {
