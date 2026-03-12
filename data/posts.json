@@ -4,5 +4,16 @@
     "bio": "A One And A Two",
     "avatar": ""
   },
-  "posts": []
+  "posts": [
+    {
+      "id": "post-1773311483532",
+      "content": "테스트 테스트",
+      "timestamp": "2026-03-12T10:31:23.532Z",
+      "parentId": null,
+      "threadId": "thread-post-1773311483532",
+      "images": [],
+      "edited": false,
+      "editedAt": null
+    }
+  ]
 }
