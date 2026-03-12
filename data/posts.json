@@ -1030,7 +1030,7 @@
           "timestamp": "2025-01-08T14:29:51.000Z"
         }
       ],
-      "hidden": true
+      "hidden": false
     }
   ],
   "writings": [],
