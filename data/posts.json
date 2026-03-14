@@ -4,5 +4,16 @@
     "bio": "A One And A Two",
     "avatar": ""
   },
-  "posts": []
+  "posts": [
+    {
+      "id": "post-1773483962976",
+      "content": "홈페이지 수정이 필요한 부분이 있다면 알려주세요!",
+      "timestamp": "2026-03-14T10:26:02.976Z",
+      "parentId": null,
+      "threadId": "thread-post-1773483962976",
+      "images": [],
+      "edited": false,
+      "editedAt": null
+    }
+  ]
 }
